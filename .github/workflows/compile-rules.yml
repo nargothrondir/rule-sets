@@ -25,6 +25,7 @@ env:
   MIHOMO_VERSION: v1.19.31
   MIHOMO_SHA256: 04cf9f09671704f839ddbee2e93069dc831a4123a75281e725d1d96ab9ac1afc
   MRS_MAGIC: 4d525301
+  SET_VERSION: '01'
 
 defaults:
   run:
@@ -106,6 +107,13 @@ jobs:
             magic=$(od -An -tx1 -N4 "$out/$name.bin" | tr -d ' \n')
             if [ "$magic" != "$MRS_MAGIC" ]; then
               echo "::error file=$src::Заголовок .mrs $magic вместо $MRS_MAGIC — формат сменился, старые клиенты файл не прочтут"
+              failed=1
+              continue
+            fi
+            extra=$(od -An -tu8 --endian=big -j13 -N8 "$out/$name.bin" | tr -d ' ')
+            inner=$(od -An -tx1 -j$((21 + extra)) -N1 "$out/$name.bin" | tr -d ' \n')
+            if [ "$inner" != "$SET_VERSION" ]; then
+              echo "::error file=$src::Внутренняя версия набора $inner вместо $SET_VERSION — старые клиенты файл не прочтут"
               failed=1
               continue
             fi
