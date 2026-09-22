@@ -1,0 +1,163 @@
+name: Compile rule-sets
+
+# Собирает *.yaml из корня репозитория в .mrs и проверяет результат. На pull request только проверяет,
+# в main — ещё и коммитит собранные файлы.
+on:
+  push:
+    branches: [main]
+    paths:
+      - '*.yaml'
+      - '*.yml'
+      - '.github/workflows/compile-rules.yml'
+  pull_request:
+    paths:
+      - '*.yaml'
+      - '*.yml'
+      - '.github/workflows/compile-rules.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+# Два запуска подряд не должны одновременно пушить в main.
+concurrency:
+  group: compile-rules-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  # Версия mihomo закреплена намеренно. Версия формата зашита в заголовок .mrs, и ядро читает
+  # только свою (rules/provider/mrs_reader.go: MrsMagicBytes). «Последний» mihomo однажды соберёт
+  # файл, который старые ядра клиентов молча не прочтут. Меняя версию — обновить и SHA256
+  # (gh release view <версия> -R MetaCubeX/mihomo --json assets).
+  MIHOMO_VERSION: v1.19.31
+  MIHOMO_SHA256: 04cf9f09671704f839ddbee2e93069dc831a4123a75281e725d1d96ab9ac1afc
+  MRS_MAGIC: 4d525301 # "MRS" + версия формата 1
+
+defaults:
+  run:
+    shell: bash --noprofile --norc -euo pipefail {0}
+
+jobs:
+  compile:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Download mihomo
+        run: |
+          curl -fsSL --retry 3 -o "$RUNNER_TEMP/mihomo.gz" \
+            "https://github.com/MetaCubeX/mihomo/releases/download/${MIHOMO_VERSION}/mihomo-linux-amd64-compatible-${MIHOMO_VERSION}.gz"
+          echo "${MIHOMO_SHA256}  $RUNNER_TEMP/mihomo.gz" | sha256sum -c -
+          gzip -d "$RUNNER_TEMP/mihomo.gz"
+          chmod +x "$RUNNER_TEMP/mihomo"
+          "$RUNNER_TEMP/mihomo" -v
+
+      - name: Compile and verify
+        run: |
+          shopt -s nullglob
+          for tool in yq zstd; do
+            command -v "$tool" >/dev/null || { echo "::error::В образе раннера нет $tool"; exit 1; }
+          done
+
+          m="$RUNNER_TEMP/mihomo"
+          out="$RUNNER_TEMP/out"
+          mkdir -p "$out"
+
+          sources=(*.yaml *.yml)
+          if [ ${#sources[@]} -eq 0 ]; then
+            echo "::error::В корне репозитория нет ни одного .yaml"
+            exit 1
+          fi
+          # proxy.yaml и proxy.yml собрались бы в один proxy.mrs
+          same=$(for s in "${sources[@]}"; do basename "${s%.*}"; done | sort | uniq -d)
+          if [ -n "$same" ]; then
+            echo "::error::Несколько исходников с одним именем: $same"
+            exit 1
+          fi
+
+          { echo "| Список | Записей | Размер .mrs |"; echo "|---|---:|---:|"; } >> "$GITHUB_STEP_SUMMARY"
+          failed=0
+
+          for src in "${sources[@]}"; do
+            name=$(basename "${src%.*}")
+            mrs="$out/$name.mrs"
+
+            # Эталон — payload так, как его понимает mihomo: без пробелов по краям, в нижнем регистре.
+            yq -r '(.payload // [])[]' "$src" > "$out/$name.raw"
+            awk '{ gsub(/^[ \t]+|[ \t]+$/, ""); if ($0 != "") print tolower($0) }' "$out/$name.raw" > "$out/$name.src"
+
+            # mihomo принимает запись с пробелом внутри и хранит её как есть — она никогда не сработает.
+            spaced=$(grep '[[:space:]]' "$out/$name.src" || true)
+            if [ -n "$spaced" ]; then
+              echo "::error file=$src::Пробел внутри записи: $(echo "$spaced" | paste -sd ',' -)"
+              failed=1
+              continue
+            fi
+            repeated=$(sort "$out/$name.src" | uniq -d)
+            if [ -n "$repeated" ]; then
+              echo "::warning file=$src::Запись повторяется: $(echo "$repeated" | paste -sd ',' -)"
+            fi
+
+            if ! log=$("$m" convert-ruleset domain yaml "$src" "$mrs" 2>&1); then
+              echo "::error file=$src::mihomo не собрал список"
+              echo "$log"
+              failed=1
+              continue
+            fi
+            # Некорректные записи mihomo выбрасывает молча, с кодом выхода 0 — поднимаем в ошибку.
+            skipped=$(grep -o 'skip invalid[^"]*"[^"]*"[^"]*' <<< "$log" || true)
+            if [ -n "$skipped" ]; then
+              while IFS= read -r line; do echo "::error file=$src::$line"; done <<< "$skipped"
+              failed=1
+            fi
+
+            zstd -q -dc "$mrs" > "$out/$name.bin"
+            magic=$(od -An -tx1 -N4 "$out/$name.bin" | tr -d ' \n')
+            if [ "$magic" != "$MRS_MAGIC" ]; then
+              echo "::error file=$src::Заголовок .mrs $magic вместо $MRS_MAGIC — формат сменился, старые клиенты файл не прочтут"
+              failed=1
+              continue
+            fi
+
+            # Распаковываем собранный файл обратно и сверяем с исходником: ничего не потеряно и не добавлено.
+            if ! "$m" convert-ruleset domain mrs "$mrs" "$out/$name.txt" > /dev/null 2>&1; then
+              echo "::error file=$src::Собранный .mrs не читается"
+              failed=1
+              continue
+            fi
+            LC_ALL=C sort -u "$out/$name.src" > "$out/$name.expected"
+            LC_ALL=C sort -u "$out/$name.txt" > "$out/$name.actual"
+            if ! diff -u "$out/$name.expected" "$out/$name.actual" > "$out/$name.diff"; then
+              echo "::error file=$src::Содержимое .mrs не совпадает с исходником (- потеряно, + лишнее)"
+              cat "$out/$name.diff"
+              failed=1
+              continue
+            fi
+
+            echo "| $name | $(wc -l < "$out/$name.actual") | $(wc -c < "$mrs") байт |" >> "$GITHUB_STEP_SUMMARY"
+          done
+
+          exit "$failed"
+
+      - name: Commit compiled rule-sets
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+        run: |
+          shopt -s nullglob
+          # .mrs без исходника — удалить, иначе jsdelivr продолжит раздавать устаревший список.
+          for f in *.mrs; do
+            n=$(basename "${f%.mrs}")
+            [ -e "$n.yaml" ] || [ -e "$n.yml" ] || git rm -q "$f"
+          done
+          cp "$RUNNER_TEMP"/out/*.mrs .
+          git add *.mrs
+
+          if git diff --cached --quiet; then
+            echo "Собранные списки не изменились — коммитить нечего"
+            exit 0
+          fi
+          git -c user.name="github-actions[bot]" \
+              -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
+              commit -q -m "chore(rules): rebuild .mrs"
+          git push || { git pull -q --rebase origin main && git push; }
