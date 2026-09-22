@@ -6,11 +6,13 @@ on:
     paths:
       - 'src/**'
       - 'mrs/**'
+      - 'tools/**'
       - '.github/workflows/compile-rules.yml'
   pull_request:
     paths:
       - 'src/**'
       - 'mrs/**'
+      - 'tools/**'
       - '.github/workflows/compile-rules.yml'
   workflow_dispatch:
 
@@ -59,9 +61,9 @@ jobs:
           out="$RUNNER_TEMP/out"
           mkdir -p "$out"
 
-          sources=(src/*.yaml src/*.yml)
+          sources=(src/domain/*.yaml src/domain/*.yml src/ipcidr/*.yaml src/ipcidr/*.yml)
           if [ ${#sources[@]} -eq 0 ]; then
-            echo "::error::В src/ нет ни одного .yaml"
+            echo "::error::В src/domain и src/ipcidr нет ни одного .yaml"
             exit 1
           fi
           same=$(for s in "${sources[@]}"; do basename "${s%.*}"; done | sort | uniq -d)
@@ -70,11 +72,12 @@ jobs:
             exit 1
           fi
 
-          { echo "| Список | Записей | Размер .mrs |"; echo "|---|---:|---:|"; } >> "$GITHUB_STEP_SUMMARY"
+          { echo "| Список | Тип | Записей | Размер .mrs |"; echo "|---|---|---:|---:|"; } >> "$GITHUB_STEP_SUMMARY"
           failed=0
 
           for src in "${sources[@]}"; do
             name=$(basename "${src%.*}")
+            behavior=$(basename "$(dirname "$src")")
             mrs="$out/$name.mrs"
 
             yq -r '(.payload // [])[]' "$src" > "$out/$name.raw"
@@ -91,13 +94,13 @@ jobs:
               echo "::warning file=$src::Запись повторяется: $(echo "$repeated" | paste -sd ',' -)"
             fi
 
-            if ! log=$("$m" convert-ruleset domain yaml "$src" "$mrs" 2>&1); then
+            if ! log=$("$m" convert-ruleset "$behavior" yaml "$src" "$mrs" 2>&1); then
               echo "::error file=$src::mihomo не собрал список"
               echo "$log"
               failed=1
               continue
             fi
-            skipped=$(grep -o 'skip invalid[^"]*"[^"]*"[^"]*' <<< "$log" || true)
+            skipped=$(grep -oE 'skip invalid[^"]*"[^"]*"[^"]*|invalid Ipcidr:\[[^]]*\]' <<< "$log" || true)
             if [ -n "$skipped" ]; then
               while IFS= read -r line; do echo "::error file=$src::$line"; done <<< "$skipped"
               failed=1
@@ -110,6 +113,13 @@ jobs:
               failed=1
               continue
             fi
+            kind=$(od -An -tx1 -j4 -N1 "$out/$name.bin" | tr -d ' \n')
+            want=$([ "$behavior" = ipcidr ] && echo 01 || echo 00)
+            if [ "$kind" != "$want" ]; then
+              echo "::error file=$src::Тип списка в заголовке $kind вместо $want"
+              failed=1
+              continue
+            fi
             extra=$(od -An -tu8 --endian=big -j13 -N8 "$out/$name.bin" | tr -d ' ')
             inner=$(od -An -tx1 -j$((21 + extra)) -N1 "$out/$name.bin" | tr -d ' \n')
             if [ "$inner" != "$SET_VERSION" ]; then
@@ -118,21 +128,30 @@ jobs:
               continue
             fi
 
-            if ! "$m" convert-ruleset domain mrs "$mrs" "$out/$name.txt" > /dev/null 2>&1; then
+            if ! "$m" convert-ruleset "$behavior" mrs "$mrs" "$out/$name.txt" > /dev/null 2>&1; then
               echo "::error file=$src::Собранный .mrs не читается"
               failed=1
               continue
             fi
-            LC_ALL=C sort -u "$out/$name.src" > "$out/$name.expected"
-            LC_ALL=C sort -u "$out/$name.txt" > "$out/$name.actual"
-            if ! diff -u "$out/$name.expected" "$out/$name.actual" > "$out/$name.diff"; then
-              echo "::error file=$src::Содержимое .mrs не совпадает с исходником (- потеряно, + лишнее)"
-              cat "$out/$name.diff"
-              failed=1
-              continue
+            if [ "$behavior" = ipcidr ]; then
+              if ! verdict=$(python3 tools/compare_ipcidr.py "$out/$name.src" "$out/$name.txt"); then
+                while IFS= read -r line; do echo "::error file=$src::$line"; done <<< "$verdict"
+                failed=1
+                continue
+              fi
+              echo "$verdict"
+            else
+              LC_ALL=C sort -u "$out/$name.src" > "$out/$name.expected"
+              LC_ALL=C sort -u "$out/$name.txt" > "$out/$name.actual"
+              if ! diff -u "$out/$name.expected" "$out/$name.actual" > "$out/$name.diff"; then
+                echo "::error file=$src::Содержимое .mrs не совпадает с исходником (- потеряно, + лишнее)"
+                cat "$out/$name.diff"
+                failed=1
+                continue
+              fi
             fi
 
-            echo "| $name | $(wc -l < "$out/$name.actual") | $(wc -c < "$mrs") байт |" >> "$GITHUB_STEP_SUMMARY"
+            echo "| $name | $behavior | $(wc -l < "$out/$name.txt") | $(wc -c < "$mrs") байт |" >> "$GITHUB_STEP_SUMMARY"
           done
 
           exit "$failed"
@@ -144,7 +163,8 @@ jobs:
           mkdir -p mrs
           for f in mrs/*.mrs; do
             n=$(basename "${f%.mrs}")
-            [ -e "src/$n.yaml" ] || [ -e "src/$n.yml" ] || git rm -q "$f"
+            [ -e "src/domain/$n.yaml" ] || [ -e "src/domain/$n.yml" ] ||
+              [ -e "src/ipcidr/$n.yaml" ] || [ -e "src/ipcidr/$n.yml" ] || git rm -q "$f"
           done
           cp "$RUNNER_TEMP"/out/*.mrs mrs/
           git add mrs/*.mrs
