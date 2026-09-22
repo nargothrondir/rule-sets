@@ -4,8 +4,8 @@
 
 | Список | Подключение |
 |---|---|
-| `proxy` | `https://cdn.jsdelivr.net/gh/nargothrondir/rule-sets@main/proxy.mrs` |
-| `direct` | `https://cdn.jsdelivr.net/gh/nargothrondir/rule-sets@main/direct.mrs` |
+| `proxy` | `https://cdn.jsdelivr.net/gh/nargothrondir/rule-sets@main/mrs/proxy.mrs` |
+| `direct` | `https://cdn.jsdelivr.net/gh/nargothrondir/rule-sets@main/mrs/direct.mrs` |
 
 ```yaml
 rule-providers:
@@ -13,21 +13,24 @@ rule-providers:
     type: http
     behavior: domain
     format: mrs
-    url: https://cdn.jsdelivr.net/gh/nargothrondir/rule-sets@main/proxy.mrs
+    url: https://cdn.jsdelivr.net/gh/nargothrondir/rule-sets@main/mrs/proxy.mrs
     path: ./rule-sets/proxy.mrs
     interval: 86400
 ```
 
+Старые адреса без `mrs/` (`@main/proxy.mrs`) пока работают, но не обновляются — переходите на новые.
+
+| Путь | Что это |
+|---|---|
+| [`src/`](src) | исходники списков |
+| [`mrs/`](mrs) | собранные списки — их пишет только сборка |
+| [`docs/lists.md`](docs/lists.md) | что в каких списках, формат записей |
+| [`docs/ci.md`](docs/ci.md) | как устроена сборка и что она проверяет |
+
 ## Правка
 
-Исходники — `*.yaml` в корне. Записи: `example.com` — только сам домен, `+.example.com` — домен
-и все поддомены. При пуше GitHub Actions собирает `.mrs` и проверяет результат, сломанный список
-не коммитится:
-
-- запись с пробелом внутри или ссылка вместо домена — ошибка: mihomo такие молча выбрасывает
-  или хранит как мусор, поэтому собранный файл распаковывается обратно и сверяется с исходником;
-- пустой список — ошибка;
-- повтор записи — предупреждение.
+Правьте `src/*.yaml` и пушьте: GitHub Actions соберёт `.mrs`, распакует их обратно, сверит с исходником
+и только тогда закоммитит. Сломанный список в `mrs/` не попадёт.
 
 jsdelivr кеширует ветку до 12 часов. Чтобы изменения разошлись сразу, откройте
-`https://purge.jsdelivr.net/gh/nargothrondir/rule-sets@main/proxy.mrs`.
+`https://purge.jsdelivr.net/gh/nargothrondir/rule-sets@main/mrs/proxy.mrs`.
